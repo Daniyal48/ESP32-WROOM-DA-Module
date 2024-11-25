@@ -1,0 +1,243 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiUdp.h>
+#include <coap-simple.h>
+
+// Definitions
+#define CONNECTION_TIMEOUT 10
+#define MAX_QUEUE_LENGTH 10
+#define TASK_STACK_SIZE 4096
+
+// Server Definitions
+WiFiServer httpServer(80);
+WiFiServer telnetServer(23);
+WiFiServer mqttServer(1883);
+WiFiUDP udp;
+
+// Mutexes and Queues
+SemaphoreHandle_t serialMutex;
+QueueHandle_t commandQueue;
+
+// Flags for service management
+bool httpActive = true;
+bool telnetActive = true;
+bool mqttActive = true;
+
+// Diagnostics and Statistics
+struct ServiceStats {
+    uint32_t connectionsHandled;
+    uint32_t bytesTransmitted;
+    uint32_t bytesReceived;
+};
+ServiceStats httpStats = {0, 0, 0};
+ServiceStats telnetStats = {0, 0, 0};
+ServiceStats mqttStats = {0, 0, 0};
+
+// Rate Limiting
+unsigned long lastHttpConnectionTime = 0;
+unsigned long lastTelnetConnectionTime = 0;
+unsigned long lastMqttConnectionTime = 0;
+const unsigned long rateLimitInterval = 1000; // 1 second between connections
+
+// WiFi Credentials
+const char *ssid = "<YOUR_WIFI_SSID_HERE";
+const char *key = "<YOUR_WIFI_PASSWORD_HERE";
+
+// CoAP Server
+Coap coap(udp);
+
+// Diagnostics
+void diagnostics() {
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    Serial.println("\nDiagnostics Report:");
+    Serial.printf("Heap Free: %u bytes\n", heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.printf("HTTP Connections: %u, Bytes Sent: %u, Bytes Received: %u\n",
+                  httpStats.connectionsHandled, httpStats.bytesTransmitted, httpStats.bytesReceived);
+    Serial.printf("Telnet Connections: %u, Bytes Sent: %u, Bytes Received: %u\n",
+                  telnetStats.connectionsHandled, telnetStats.bytesTransmitted, telnetStats.bytesReceived);
+    Serial.printf("MQTT Connections: %u, Bytes Sent: %u, Bytes Received: %u\n",
+                  mqttStats.connectionsHandled, mqttStats.bytesTransmitted, mqttStats.bytesReceived);
+    xSemaphoreGive(serialMutex);
+}
+
+// Graceful Shutdown
+void shutdownServices() {
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    httpActive = telnetActive = mqttActive = false;
+    Serial.println("Graceful shutdown initiated. All services disabled.");
+    xSemaphoreGive(serialMutex);
+}
+
+// Rate Limiting Function
+bool canAcceptConnection(unsigned long &lastConnectionTime) {
+    unsigned long currentTime = millis();
+    if (currentTime - lastConnectionTime < rateLimitInterval) {
+        return false;
+    }
+    lastConnectionTime = currentTime;
+    return true;
+}
+
+// HTTP Server Task
+void handleHTTP(void *param) {
+    while (true) {
+        if (httpActive) {
+            WiFiClient client = httpServer.available();
+            if (client && canAcceptConnection(lastHttpConnectionTime)) {
+                httpStats.connectionsHandled++;
+                String response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>HTTP Service Active</h1>";
+                httpStats.bytesTransmitted += response.length();
+                client.print(response);
+                client.stop();
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// Telnet Server Task
+void handleTelnet(void *param) {
+    while (true) {
+        if (telnetActive) {
+            WiFiClient client = telnetServer.available();
+            if (client && canAcceptConnection(lastTelnetConnectionTime)) {
+                telnetStats.connectionsHandled++;
+                String response = "Welcome to the Telnet Service!";
+                telnetStats.bytesTransmitted += response.length();
+                client.print(response);
+                client.stop();
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// MQTT Server Task
+void handleMQTT(void *param) {
+    while (true) {
+        if (mqttActive) {
+            WiFiClient client = mqttServer.available();
+            if (client && canAcceptConnection(lastMqttConnectionTime)) {
+                mqttStats.connectionsHandled++;
+                String response = "MQTT Service Mock Response";
+                mqttStats.bytesTransmitted += response.length();
+                client.print(response);
+                client.stop();
+            }
+        }
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// UPnP Broadcast Task
+void handleUPnP(void* param) {
+    // Join multicast group 239.255.255.250 on port 1900
+    if (udp.beginMulticast(IPAddress(239, 255, 255, 250), 1900)) {
+        udp.print("UPnP broadcast message");
+        udp.endPacket();
+        vTaskDelete(NULL); // Cleanly delete the task after sending the message
+    } else {
+        Serial.println("Failed to join multicast group!");
+        vTaskDelete(NULL); // Exit the task if multicast joining fails
+    }
+}
+
+
+// CoAP Server Callback
+void coapCallback(CoapPacket& packet, IPAddress ip, int port) {
+    String response = "CoAP response";
+    udp.beginPacket(ip, port);
+    udp.write((const uint8_t*)response.c_str(), response.length());
+    udp.endPacket();
+}
+
+// CoAP Task
+void handleCoAP(void *param) {
+    while (true) {
+        coap.loop();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+    }
+}
+
+// Command Processor Task
+void processCommands(void *param) {
+    char command[50];
+    while (true) {
+        if (xQueueReceive(commandQueue, &command, portMAX_DELAY)) {
+            if (strcmp(command, "diagnostics") == 0) {
+                diagnostics();
+            } else if (strcmp(command, "network-info") == 0) {
+                xSemaphoreTake(serialMutex, portMAX_DELAY);
+                Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+                Serial.printf("MAC Address: %s\n", WiFi.macAddress().c_str());
+                xSemaphoreGive(serialMutex);
+            } else if (strcmp(command, "shutdown") == 0) {
+                shutdownServices();
+            } else if (strcmp(command, "help") == 0) {
+                xSemaphoreTake(serialMutex, portMAX_DELAY);
+                Serial.println("Available Commands:");
+                Serial.println("- diagnostics: Show system diagnostics");
+                Serial.println("- network-info: Show network information");
+                Serial.println("- shutdown: Gracefully shut down services");
+                Serial.println("- help: Display available commands");
+                xSemaphoreGive(serialMutex);
+            } else {
+                xSemaphoreTake(serialMutex, portMAX_DELAY);
+                Serial.println("Unknown Command. Type 'help' for a list of commands.");
+                xSemaphoreGive(serialMutex);
+            }
+        }
+    }
+}
+
+// Setup WiFi
+void setupWiFi() {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, key);
+    Serial.print("\nConnecting to WiFi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.printf("\nConnected! IP Address: %s\n", WiFi.localIP().toString().c_str());
+}
+
+// Setup Function
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    // Initialize Mutex and Queue
+    serialMutex = xSemaphoreCreateMutex();
+    commandQueue = xQueueCreate(MAX_QUEUE_LENGTH, sizeof(char) * 50);
+
+    // Initialize WiFi and Servers
+    setupWiFi();
+    httpServer.begin();
+    telnetServer.begin();
+    mqttServer.begin();
+    udp.begin(5683); // CoAP port
+    coap.server(coapCallback, "/");
+
+    // Create Server Tasks
+    xTaskCreate(handleHTTP, "HTTP Task", TASK_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(handleTelnet, "Telnet Task", TASK_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(handleMQTT, "MQTT Task", TASK_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(handleUPnP, "UPnP Task", TASK_STACK_SIZE, NULL, 1, NULL);
+    xTaskCreate(handleCoAP, "CoAP Task", TASK_STACK_SIZE, NULL, 1, NULL);
+
+    // Create Command Processor Task
+    xTaskCreate(processCommands, "Command Processor", TASK_STACK_SIZE, NULL, 1, NULL);
+
+    Serial.println("System Ready! Type 'help' for commands.");
+}
+
+// Loop Function
+void loop() {
+    if (Serial.available() > 0) {
+        char command[50];
+        Serial.readBytesUntil('\n', command, sizeof(command));
+        command[strcspn(command, "\r\n")] = 0; // Trim newline
+        xQueueSend(commandQueue, &command, portMAX_DELAY);
+    }
+}
